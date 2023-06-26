@@ -12,11 +12,22 @@ use std::{
     collections::HashMap,
     sync::{Arc, Mutex},
 };
+
+const MESSAGE_DELAY: i64 = 1500;
+
 pub struct Handler {
     connection: Arc<Mutex<sqlite::Connection>>,
+    last_message: Arc<Mutex<HashMap<u64,Timestamp>>>,
 }
 
 impl Handler {
+    pub fn is_on_cooldown(&self, message: &Message) -> Result<bool, crate::error::Error> {
+        let last_message = self.last_message.lock()?;
+        if last_message.contains_key(&message.channel_id.0) {
+            return Ok(message.timestamp.timestamp_millis() - last_message.get(&message.channel_id.0).unwrap().timestamp_millis() < MESSAGE_DELAY);
+        }
+        Ok(false)
+    }
     pub fn add_channel(&self, channelid: &ChannelId) -> Result<(), crate::error::Error> {
         let connection = self.connection.lock()?;
         Ok(connection.execute(format!(
@@ -44,11 +55,13 @@ impl Handler {
             > 0;
         Ok(is_registered)
     }
-    pub fn append_text(&self, channelid: &ChannelId, user: &User, msg: &str) -> Result<(), crate::error::Error> {
+    pub fn append_text(&self, message: &Message) -> Result<(), crate::error::Error> {
+        let mut last_message = self.last_message.lock()?;
         let connection = self.connection.lock()?;
+        last_message.insert(message.channel_id.0, message.timestamp);
         Ok(connection.execute(format!(
             "UPDATE channels SET text = text || '{} ',last_user = {}  WHERE id={};",
-            msg, user.id.0, channelid.0
+            message.content, message.author.id.0, message.channel_id.0
         ))?)
     }
     pub fn pop_text(&self, channelid: &ChannelId) -> Result<String,crate::error::Error> {
@@ -72,6 +85,7 @@ impl Default for Handler {
     fn default() -> Self {
         Self {
             connection: Arc::new(Mutex::new(sqlite::open("oneworddb.sqlite").unwrap())),
+            last_message: Arc::new(Mutex::new(HashMap::default())),
         }
     }
 }
@@ -83,6 +97,10 @@ impl EventHandler for Handler {
             .is_channel_registered(&message.channel_id)
             .unwrap_or(false) && !&message.author.bot
         {
+            if self.is_on_cooldown(&message).unwrap() {
+                ctx.http.delete_message(message.channel_id.0, message.id.0).await.unwrap();
+                return;
+            }
             if message.content.contains(' ') || self.is_last_message_sender(&message.channel_id, &message.author).unwrap() {
                 ctx.http.delete_message(message.channel_id.0, message.id.0).await.unwrap();
                 ctx.http
@@ -97,7 +115,7 @@ impl EventHandler for Handler {
                     .await
                     .unwrap();
             } else {
-                self.append_text(&message.channel_id, &message.author, &message.content).unwrap();
+                self.append_text(&message).unwrap();
                 if message.content.contains(".") {
                     let string = self.pop_text(&message.channel_id).unwrap();
                     println!("{}",string);
