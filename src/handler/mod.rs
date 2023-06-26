@@ -28,11 +28,15 @@ impl Handler {
         }
         Ok(false)
     }
-    pub fn add_channel(&self, channelid: &ChannelId) -> Result<(), crate::error::Error> {
+    pub fn add_channel(&self, channelid: &ChannelId, relay: &Option<ChannelId>) -> Result<(), crate::error::Error> {
         let connection = self.connection.lock()?;
+        connection.execute(format!(
+            "UPDATE channels SET relay = '{} ' WHERE id={};",
+            relay.map(|v| v.0).unwrap_or(0), channelid.0
+        ))?;
         Ok(connection.execute(format!(
-            "INSERT OR IGNORE INTO channels(id,text) VALUES ({},'')",
-            channelid.0
+            "INSERT OR IGNORE INTO channels(id,text,relay) VALUES ({},'',{})",
+            channelid.0,relay.map(|v| v.0).unwrap_or(0)
         ))?)
     }
     pub fn remove_channel(&self, channelid: &ChannelId) -> Result<(), crate::error::Error> {
@@ -64,18 +68,20 @@ impl Handler {
             message.content, message.author.id.0, message.channel_id.0
         ))?)
     }
-    pub fn pop_text(&self, channelid: &ChannelId) -> Result<String,crate::error::Error> {
+    pub fn pop_text(&self, channelid: &ChannelId) -> Result<(String,Option<ChannelId>),crate::error::Error> {
         let connection = self.connection.lock()?;
         let mut state = connection
-            .prepare(format!("SELECT text FROM channels WHERE id={}", channelid.0))?;
+            .prepare(format!("SELECT text,relay FROM channels WHERE id={}", channelid.0))?;
         if let Ok(State::Row) = state.next() {
             let string = state.read::<String, _>(0).unwrap();
+            let id = state.read::<i64, _>(1).unwrap();
+            let id = id as u64;
             drop(state);
             connection.execute(format!(
                 "UPDATE channels SET text = '',last_user = 0 WHERE id={};",
                 channelid.0
             ))?;
-            return Ok(string);
+            return Ok((string,if id==0 { None } else { Some(ChannelId(id)) }));
         }
         Err(crate::error::Error::UnknownError)
     }
@@ -117,13 +123,20 @@ impl EventHandler for Handler {
             } else {
                 self.append_text(&message).unwrap();
                 if message.content.contains(".") {
-                    let string = self.pop_text(&message.channel_id).unwrap();
+                    let (string,relay) = self.pop_text(&message.channel_id).unwrap();
                     println!("{}",string);
                     message.channel_id.send_message(&ctx.http,|msg| {
                         msg.embed(|embed| {
                             embed.description(&string)
                         })
                     }).await.unwrap();
+                    if let Some(relay) = relay {
+                        relay.send_message(&ctx.http,|msg| {
+                            msg.embed(|embed| {
+                                embed.description(&string)
+                            })
+                        }).await.unwrap();
+                    }
                 }
             }
         }
@@ -143,13 +156,19 @@ impl EventHandler for Handler {
                         .unwrap_or(false);
                         if is_admin {
                             let value = || -> Option<u64> {
-                                match options.get(0)?.resolved.clone()? {
-                                    CommandDataOptionValue::Channel(channel) => Some(channel.id.0),
+                                options.iter().filter(|v| v.name=="channel").map(|v| v.resolved.clone()).filter_map(|v| match v {
+                                    Some(CommandDataOptionValue::Channel(channel)) => Some(channel.id.0),
                                     _ => None,
-                                }
+                                }).collect::<Vec<_>>().get(0).copied()
+                            }();
+                            let relay = || -> Option<u64> {
+                                options.iter().filter(|v| v.name=="relay").map(|v| v.resolved.clone()).filter_map(|v| match v {
+                                    Some(CommandDataOptionValue::Channel(channel)) => Some(channel.id.0),
+                                    _ => None,
+                                }).collect::<Vec<_>>().get(0).copied()
                             }();
                             match value {
-                                Some(channel) => match self.add_channel(&ChannelId(channel)) {
+                                Some(channel) => match self.add_channel(&ChannelId(channel),&relay.map(|v| ChannelId(v))) {
                                     Ok(_) => {
                                         command.create_interaction_response(&ctx.http, |response| {
                                         response.kind(interaction::InteractionResponseType::ChannelMessageWithSource).interaction_response_data(|response| {
@@ -209,6 +228,13 @@ impl EventHandler for Handler {
                     serenity::builder::CreateApplicationCommandOption(HashMap::from([]))
                         .name("channel")
                         .description("Channel to add")
+                        .kind(serenity::model::prelude::command::CommandOptionType::Channel)
+                        .clone(),
+                )
+                .add_option(
+                    serenity::builder::CreateApplicationCommandOption(HashMap::from([]))
+                        .name("relay")
+                        .description("Channel to relay to")
                         .kind(serenity::model::prelude::command::CommandOptionType::Channel)
                         .clone(),
                 )
